@@ -278,5 +278,4 @@ DocVoice/
 см. [`LICENSE-ruaccent.txt`](docvoice/accent/LICENSE-ruaccent.txt)). Голосовые модели
 в репозиторий не входят и скачиваются пользователем на условиях их авторов:
 [Piper](https://github.com/rhasspy/piper) — см. описание каждого голоса,
-[Silero](https://github.com/snakers4/silero-models) — CC BY-NC, только некоммерческое
-использование.
+[Silero](https://github.com/snakers4/silero-models) — CC BY-NC.
