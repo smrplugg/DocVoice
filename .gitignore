@@ -1,0 +1,29 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# --- Сборка PyInstaller ---
+build/
+dist/
+release/
+models/
+*.spec
+
+# --- Данные пользователя: голоса, модели, настройки (там API-ключи!), журналы ---
+data/
+*.log
+
+# --- Локальные секреты ---
+docvoice/support_config.py
+
+# --- Разное ---
+_archive/
+*.zip
+.claude/
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini

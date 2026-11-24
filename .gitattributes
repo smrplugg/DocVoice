@@ -1,0 +1,9 @@
+* text=auto
+# cmd.exe плохо переносит LF в .bat — всегда CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+# Inno Setup: CRLF и UTF-8 с BOM (BOM git сохраняет как есть)
+*.iss text eol=crlf
+*.yml text eol=lf
+*.py  text eol=lf
+*.md  text eol=lf

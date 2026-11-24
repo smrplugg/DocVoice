@@ -1,0 +1,184 @@
+# Сборка DocVoice для Windows и выкладка установщика в Releases.
+#
+#  * git tag v1.2.3 && git push --tags  → сборка + релиз с DocVoice-Setup-1.2.3.exe
+#  * вкладка Actions → «Сборка» → Run workflow  → сборка без релиза
+#    (установщик — в артефактах запуска, хранится 14 дней)
+#
+# В установщик входит всё: Silero (PyTorch CPU), 4 голоса Piper и умные ударения —
+# после установки программа работает сразу, без скачиваний.
+
+name: Сборка
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # чтобы создать релиз
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      MODELS_DIR: ${{ github.workspace }}\models
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Версия
+        id: ver
+        shell: pwsh
+        run: |
+          $code = (Select-String -Path docvoice/__init__.py -Pattern '__version__\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $v = "${{ github.ref_name }}".TrimStart("v")
+            if ($v -ne $code) { Write-Host "::warning::Тег v$v, а в docvoice/__init__.py версия $code" }
+          } else {
+            $v = "$code-dev.${{ github.run_number }}"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Версия: $v"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Зависимости (+ PyTorch CPU для Silero)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pyinstaller
+
+      # Адрес и ключ «Связи с разработчиком» — из секретов репозитория
+      # (Settings → Secrets and variables → Actions). Нет секретов — кнопка
+      # работает запасным путём: архив на рабочий стол + письмо через почтовую программу.
+      - name: Настройки поддержки
+        shell: pwsh
+        env:
+          SUPPORT_URL: ${{ secrets.SUPPORT_URL }}
+          SUPPORT_TOKEN: ${{ secrets.SUPPORT_TOKEN }}
+        run: |
+          if ($env:SUPPORT_URL) {
+            @"
+          SUPPORT_URL = "$env:SUPPORT_URL"
+          SUPPORT_TOKEN = "$env:SUPPORT_TOKEN"
+          "@ | Set-Content -Encoding utf8 docvoice/support_config.py
+            Write-Host "support_config.py создан"
+          } else {
+            Write-Host "::notice::Секрет SUPPORT_URL не задан — отправка отчётов через интернет будет выключена"
+          }
+
+      # Модели весят ~800 МБ и меняются редко — храним их в кэше GitHub
+      - name: Кэш моделей
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: models-${{ hashFiles('tools/fetch_models.py', 'docvoice/accent/__init__.py', 'docvoice/engines.py') }}
+          restore-keys: models-
+
+      - name: Скачать голоса и модели
+        run: python tools/fetch_models.py "${{ env.MODELS_DIR }}"
+
+      # Флаги те же, что в build_exe.bat (сборка с Silero) — меняя одно, поправьте и другое
+      - name: PyInstaller
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --noupx --name DocVoice `
+            --collect-all piper --collect-data num2words `
+            --hidden-import win32com.client --hidden-import pythoncom `
+            --exclude-module pymupdf.layout --exclude-module pymupdf4llm `
+            --hidden-import tokenizers --hidden-import razdel --hidden-import docvoice.support_config `
+            --hidden-import torch.package --hidden-import torch.jit._script `
+            --hidden-import wave --hidden-import gzip --hidden-import unicodedata `
+            --hidden-import xml.etree.ElementTree --hidden-import json `
+            --add-data "docvoice\accent\LICENSE-ruaccent.txt;docvoice\accent" `
+            run.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Собрать папку программы
+        shell: pwsh
+        run: |
+          $app = "dist\DocVoice"
+          New-Item -ItemType Directory -Force "$app\data" | Out-Null
+          Copy-Item -Recurse -Force "$env:MODELS_DIR\*" "$app\data"
+          Copy-Item docs\*.txt $app
+          Copy-Item LICENSE "$app\LICENSE.txt"
+          # библиотеки VC++, без которых PyTorch не стартует на «чистых» компьютерах (как fix_silero_dll.bat)
+          $lib = "$app\_internal\torch\lib"
+          foreach ($d in "vcruntime140_threads.dll","msvcp140_1.dll","msvcp140_2.dll","msvcp140_atomic_wait.dll","concrt140.dll","vcomp140.dll") {
+            $src = "$env:SystemRoot\System32\$d"
+            if ((Test-Path $lib) -and (Test-Path $src)) { Copy-Item -Force $src $lib; Write-Host "+ $d" }
+          }
+
+      - name: Самопроверка собранной программы
+        shell: pwsh
+        continue-on-error: true   # на сервере GitHub нет звуковой карты — часть проверок не пройдёт
+        run: |
+          $app = "dist\DocVoice"
+          $p = Start-Process "$app\DocVoice.exe" -ArgumentList "--selftest" -PassThru
+          if (-not $p.WaitForExit(300000)) { $p.Kill(); Write-Host "::warning::Самопроверка не уложилась в 5 минут" }
+          Get-Content -Encoding utf8 "$app\data\logs\selftest.txt" -ErrorAction SilentlyContinue
+          Write-Host "Код выхода: $($p.ExitCode)"
+
+      - name: Убрать следы самопроверки
+        shell: pwsh
+        run: |
+          $data = "dist\DocVoice\data"
+          # то же, что build_exe.bat не переносит в сборку: журналы, рабочие копии, следы проверки
+          foreach ($d in "logs", "espeak-ng-data", "espeak-ng-data.tmp", "проверка-ёжик") {
+            Remove-Item -Recurse -Force "$data\$d" -ErrorAction SilentlyContinue
+          }
+          Remove-Item -Force "$data\settings.json", "$data\crash.log" -ErrorAction SilentlyContinue
+          Get-ChildItem $data -Recurse -Include *.tmp,*.part | Remove-Item -Force
+          $size = (Get-ChildItem dist\DocVoice -Recurse -File | Measure-Object Length -Sum).Sum / 1GB
+          Write-Host ("Размер программы: {0:N2} ГБ" -f $size)
+
+      - name: Установщик (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceDir=$PWD\dist\DocVoice" "/DOutputDir=$PWD\release" installer\DocVoice.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-ChildItem release | ForEach-Object { Write-Host ("{0}  {1:N0} МБ" -f $_.Name, ($_.Length / 1MB)) }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DocVoice-Setup-${{ steps.ver.outputs.version }}
+          path: release/*.exe
+          retention-days: 14
+          compression-level: 0
+
+      - name: Релиз
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: DocVoice ${{ steps.ver.outputs.version }}
+          files: release/*.exe
+          generate_release_notes: true
+          body: |
+            ## Как установить
+
+            1. Скачайте **DocVoice-Setup-${{ steps.ver.outputs.version }}.exe** (ниже, в разделе Assets).
+            2. Откройте скачанный файл и нажимайте «Далее».
+            3. Если Windows покажет синее окно «Система Windows защитила ваш компьютер» — нажмите
+               **«Подробнее»**, затем **«Выполнить в любом случае»**. Так Windows реагирует на любую
+               новую программу без платной цифровой подписи.
+            4. Готово — на рабочем столе появится значок **DocVoice**.
+
+            Голоса, Silero и умные ударения уже внутри — интернет после установки не нужен.
+            Обновление ставится поверх старой версии, настройки сохраняются.
